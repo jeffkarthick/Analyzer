@@ -1,169 +1,6 @@
 import crypto from "crypto";
 
-const GROQ_URL =
-  "https://api.groq.com/openai/v1/chat/completions";
-
-const MODEL = "openai/gpt-oss-20b";
-
-// Keep requests safely below Groq 8K token limit.
-const CHUNK_CHARS = 9000;
-
-// Number of chunk summaries sent to one group-analysis request.
-const GROUP_SIZE = 6;
-
-// Cache for 30 days.
-const CACHE_SECONDS = 60 * 60 * 24 * 30;
-
-
-// ======================================================
-// HASH
-// ======================================================
-
-function createHash(text, exName) {
-  return crypto
-    .createHash("sha256")
-    .update(`${exName || ""}|${text}`)
-    .digest("hex");
-}
-
-
-// ======================================================
-// UPSTASH
-// ======================================================
-
-async function redis(command) {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  if (!url || !token) {
-    throw new Error(
-      "UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN is missing."
-    );
-  }
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(command)
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.error ||
-      data?.message ||
-      "Upstash request failed."
-    );
-  }
-
-  return data.result;
-}
-
-
-// ======================================================
-// GROQ
-// ======================================================
-
-async function groq(prompt, maxTokens = 600) {
-  const response = await fetch(GROQ_URL, {
-    method: "POST",
-
-    headers: {
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-
-    body: JSON.stringify({
-      model: MODEL,
-
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are CHATBACK, a neutral WhatsApp relationship chat analyzer. Infer patterns only from the text. Never claim certainty about private feelings."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-
-      temperature: 0.3,
-      max_tokens: maxTokens
-    })
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    console.error("GROQ ERROR:", data);
-
-    throw new Error(
-      data?.error?.message ||
-      "Groq request failed."
-    );
-  }
-
-  const result =
-    data?.choices?.[0]?.message?.content;
-
-  if (!result) {
-    throw new Error(
-      "Groq returned an empty response."
-    );
-  }
-
-  return result;
-}
-
-
-// ======================================================
-// SPLIT WHATSAPP CHAT
-// ======================================================
-
-function splitChat(chatText) {
-  const lines = chatText.split(/\r?\n/);
-
-  const chunks = [];
-  let current = "";
-
-  for (const line of lines) {
-
-    if (
-      current.length + line.length + 1 >
-      CHUNK_CHARS
-    ) {
-
-      if (current.trim()) {
-        chunks.push(current.trim());
-      }
-
-      current = line + "\n";
-
-    } else {
-
-      current += line + "\n";
-    }
-  }
-
-  if (current.trim()) {
-    chunks.push(current.trim());
-  }
-
-  return chunks;
-}
-
-
-// ======================================================
-// MAIN
-// ======================================================
-
 export default async function handler(req, res) {
-
   if (req.method !== "POST") {
     return res.status(405).json({
       error: "Method not allowed"
@@ -171,508 +8,392 @@ export default async function handler(req, res) {
   }
 
   try {
+    const { exName, chatText } = req.body || {};
 
-    const {
-      exName,
-      chatText,
-      premium = false
-    } = req.body || {};
-
-
-    // ==================================================
-    // ENVIRONMENT CHECK
-    // ==================================================
-
-    if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({
-        error: "GROQ_API_KEY is missing."
-      });
-    }
-
-    if (
-      !process.env.UPSTASH_REDIS_REST_URL ||
-      !process.env.UPSTASH_REDIS_REST_TOKEN
-    ) {
-      return res.status(500).json({
-        error:
-          "Upstash Redis environment variables are missing."
-      });
-    }
-
-
-    // ==================================================
-    // CHAT VALIDATION
-    // ==================================================
-
-    if (
-      !chatText ||
-      typeof chatText !== "string" ||
-      chatText.trim().length < 20
-    ) {
+    if (!chatText || String(chatText).trim().length < 20) {
       return res.status(400).json({
-        error:
-          "Please provide a WhatsApp chat."
+        error: "Please provide a WhatsApp chat."
       });
     }
 
-    const cleanChat = chatText.trim();
+    const groqKey = process.env.GROQ_API_KEY;
+    const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
 
+    if (!groqKey) {
+      return res.status(500).json({
+        error: "GROQ_API_KEY is missing in Vercel."
+      });
+    }
 
-    // ==================================================
+    if (!redisUrl || !redisToken) {
+      return res.status(500).json({
+        error: "Upstash Redis environment variables are missing."
+      });
+    }
+
+    // ---------------------------------------
+    // UPSTASH REDIS
+    // ---------------------------------------
+
+    async function redisCommand(command) {
+      const response = await fetch(redisUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${redisToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(command)
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data?.error || "Redis request failed."
+        );
+      }
+
+      return data?.result;
+    }
+
+    // ---------------------------------------
+    // CLEAN CHAT
+    // ---------------------------------------
+
+    const cleanChat = String(chatText)
+      .replace(/\r/g, "")
+      .trim();
+
+    // ---------------------------------------
     // CREATE CHAT HASH
-    // ==================================================
+    // ---------------------------------------
 
-    const chatHash = createHash(
-      cleanChat,
-      exName
-    );
+    const chatHash = crypto
+      .createHash("sha256")
+      .update(cleanChat)
+      .digest("hex");
 
-    console.log(
-      "CHAT HASH:",
-      chatHash
-    );
+    const cacheKey = `chatback:free:${chatHash}`;
 
+    // ---------------------------------------
+    // CHECK CACHE
+    // ---------------------------------------
 
-    // ==================================================
-    // CHECK FINAL CACHE
-    // ==================================================
+    const cachedResult = await redisCommand([
+      "GET",
+      cacheKey
+    ]);
 
-    const finalCacheKey =
-      `chatback:final:${chatHash}`;
-
-    const cachedFinal =
-      await redis([
-        "GET",
-        finalCacheKey
-      ]);
-
-
-    // ==================================================
-    // CACHE HIT
-    // ==================================================
-
-    if (cachedFinal) {
-
-      console.log(
-        "FINAL CACHE HIT"
-      );
-
-      const parsed =
-        typeof cachedFinal === "string"
-          ? JSON.parse(cachedFinal)
-          : cachedFinal;
-
+    if (cachedResult) {
       return res.status(200).json({
         success: true,
-        cached: true,
-        result: parsed.result,
-        chunks: parsed.chunks || 0
+        result: cachedResult,
+        cached: true
       });
     }
 
+    // ---------------------------------------
+    // SMART CHAT COMPRESSION
+    // ---------------------------------------
 
-    // ==================================================
-    // SPLIT CHAT
-    // ==================================================
+    function smartCompressChat(text) {
+      const MAX_CHARS = 10000;
 
-    const chunks =
-      splitChat(cleanChat);
-
-    console.log(
-      "TOTAL CHUNKS:",
-      chunks.length
-    );
-
-
-    // ==================================================
-    // ANALYSE EACH CHUNK
-    // ==================================================
-
-    const chunkSummaries = [];
-
-    for (
-      let i = 0;
-      i < chunks.length;
-      i++
-    ) {
-
-      const chunkKey =
-        `chatback:chunk:${chatHash}:${i}`;
-
-      // ----------------------------------------------
-      // CHECK CHUNK CACHE
-      // ----------------------------------------------
-
-      const cachedChunk =
-        await redis([
-          "GET",
-          chunkKey
-        ]);
-
-
-      if (cachedChunk) {
-
-        console.log(
-          `CHUNK ${i + 1} CACHE HIT`
-        );
-
-        const parsed =
-          typeof cachedChunk === "string"
-            ? JSON.parse(cachedChunk)
-            : cachedChunk;
-
-        chunkSummaries.push(
-          parsed.summary
-        );
-
-        continue;
+      if (text.length <= MAX_CHARS) {
+        return text;
       }
 
+      let lines = text
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean);
 
-      // ----------------------------------------------
-      // GROQ CHUNK ANALYSIS
-      // ----------------------------------------------
+      // Remove common WhatsApp system/media lines
+      lines = lines.filter(line => {
+        const lower = line.toLowerCase();
 
-      console.log(
-        `ANALYSING CHUNK ${i + 1}/${chunks.length}`
+        if (
+          lower.includes("messages and calls are end-to-end encrypted")
+        ) {
+          return false;
+        }
+
+        if (
+          lower.includes("<media omitted>")
+        ) {
+          return false;
+        }
+
+        if (
+          lower.includes("image omitted")
+        ) {
+          return false;
+        }
+
+        if (
+          lower.includes("video omitted")
+        ) {
+          return false;
+        }
+
+        if (
+          lower.includes("audio omitted")
+        ) {
+          return false;
+        }
+
+        if (
+          lower.includes("sticker omitted")
+        ) {
+          return false;
+        }
+
+        return true;
+      });
+
+      if (lines.length === 0) {
+        return text.slice(0, MAX_CHARS);
+      }
+
+      /*
+        Take messages from:
+        - beginning
+        - middle
+        - end
+
+        This keeps relationship history balanced.
+      */
+
+      const selected = [];
+
+      const firstCount = Math.floor(lines.length * 0.30);
+      const middleCount = Math.floor(lines.length * 0.40);
+      const lastCount = Math.floor(lines.length * 0.30);
+
+      // Beginning
+      for (let i = 0; i < firstCount; i++) {
+        selected.push(lines[i]);
+      }
+
+      // Middle
+      const middleStart = Math.floor(
+        (lines.length - middleCount) / 2
       );
 
-      const prompt = `
-You are analysing part ${i + 1} of ${
-        chunks.length
-      } of a WhatsApp conversation.
+      for (
+        let i = middleStart;
+        i < middleStart + middleCount;
+        i++
+      ) {
+        if (lines[i]) {
+          selected.push(lines[i]);
+        }
+      }
 
-Person being analysed:
-${exName || "Unknown"}
+      // End
+      for (
+        let i = Math.max(
+          0,
+          lines.length - lastCount
+        );
+        i < lines.length;
+        i++
+      ) {
+        selected.push(lines[i]);
+      }
 
-Extract useful relationship patterns from this
-part of the conversation.
+      // Remove duplicates
+      const uniqueLines = [
+        ...new Set(selected)
+      ];
 
-Focus on:
+      let result = "";
 
-- Who initiates conversations
-- Who replies more
-- Emotional tone
-- Interest and engagement
-- Communication style
-- Affection indicators
-- Distance indicators
-- Positive signs
-- Negative signs
-- Important behaviour changes
-- Important evidence from the messages
+      for (const line of uniqueLines) {
+        if (
+          result.length + line.length + 1 >
+          MAX_CHARS
+        ) {
+          break;
+        }
 
-Do NOT claim certainty about private feelings.
+        result += line + "\n";
+      }
 
-Return concise analytical notes that can later
-be combined with other parts of the conversation.
+      return `
+[CHAT COMPRESSED LOCALLY]
 
-CHAT PART:
+The original WhatsApp chat was large.
+A representative sample was selected from the
+beginning, middle and end of the conversation.
 
-${chunks[i]}
+Do not assume missing parts of the conversation.
+
+${result}
 `;
-
-      const summary =
-        await groq(
-          prompt,
-          500
-        );
-
-
-      // ----------------------------------------------
-      // SAVE CHUNK SUMMARY
-      // ----------------------------------------------
-
-      await redis([
-        "SET",
-        chunkKey,
-        JSON.stringify({
-          summary,
-          chunk: i,
-          createdAt:
-            new Date().toISOString()
-        }),
-        "EX",
-        String(CACHE_SECONDS)
-      ]);
-
-      chunkSummaries.push(summary);
-
-
-      // ----------------------------------------------
-      // SMALL DELAY
-      // ----------------------------------------------
-
-      if (i < chunks.length - 1) {
-
-        await new Promise(
-          resolve =>
-            setTimeout(resolve, 1500)
-        );
-      }
     }
 
+    const compressedChat =
+      smartCompressChat(cleanChat);
 
-    // ==================================================
-    // GROUP SUMMARIES
-    // ==================================================
+    // ---------------------------------------
+    // GROQ - ONLY ONE REQUEST
+    // ---------------------------------------
 
-    const groups = [];
+    const prompt = `
+You are CHATBACK, an AI relationship chat analyzer.
 
-    for (
-      let i = 0;
-      i < chunkSummaries.length;
-      i += GROUP_SIZE
-    ) {
-
-      groups.push(
-        chunkSummaries.slice(
-          i,
-          i + GROUP_SIZE
-        )
-      );
-    }
-
-    console.log(
-      "TOTAL GROUPS:",
-      groups.length
-    );
-
-
-    // ==================================================
-    // ANALYSE GROUPS
-    // ==================================================
-
-    const groupSummaries = [];
-
-    for (
-      let i = 0;
-      i < groups.length;
-      i++
-    ) {
-
-      const groupKey =
-        `chatback:group:${chatHash}:${i}`;
-
-      // ----------------------------------------------
-      // CHECK GROUP CACHE
-      // ----------------------------------------------
-
-      const cachedGroup =
-        await redis([
-          "GET",
-          groupKey
-        ]);
-
-      if (cachedGroup) {
-
-        console.log(
-          `GROUP ${i + 1} CACHE HIT`
-        );
-
-        const parsed =
-          typeof cachedGroup === "string"
-            ? JSON.parse(cachedGroup)
-            : cachedGroup;
-
-        groupSummaries.push(
-          parsed.summary
-        );
-
-        continue;
-      }
-
-
-      // ----------------------------------------------
-      // GROUP PROMPT
-      // ----------------------------------------------
-
-      const groupText =
-        groups[i].join(
-          "\n\n--- NEXT SECTION ---\n\n"
-        );
-
-      const prompt = `
-You are CHATBACK.
-
-You are combining several analysis sections
-from the same WhatsApp conversation.
-
-Person:
+Person being analyzed:
 ${exName || "Unknown"}
 
-Identify the larger patterns across these
-sections.
+Analyze the WhatsApp conversation below.
 
-Focus on:
+IMPORTANT RULES:
 
-- Initiation balance
-- Emotional investment indicators
-- Communication consistency
-- Affection
-- Distance
-- Conflict
-- Interest
-- Positive relationship signals
-- Negative relationship signals
-- Behaviour changes
-
-Do not claim certainty about private feelings.
-
-Return a concise overall relationship summary.
-
-SECTION ANALYSES:
-
-${groupText}
-`;
-
-      const summary =
-        await groq(
-          prompt,
-          600
-        );
-
-
-      // ----------------------------------------------
-      // SAVE GROUP
-      // ----------------------------------------------
-
-      await redis([
-        "SET",
-        groupKey,
-        JSON.stringify({
-          summary,
-          group: i,
-          createdAt:
-            new Date().toISOString()
-        }),
-        "EX",
-        String(CACHE_SECONDS)
-      ]);
-
-      groupSummaries.push(summary);
-
-
-      // ----------------------------------------------
-      // DELAY
-      // ----------------------------------------------
-
-      if (i < groups.length - 1) {
-
-        await new Promise(
-          resolve =>
-            setTimeout(resolve, 1500)
-        );
-      }
-    }
-
-
-    // ==================================================
-    // FINAL ANALYSIS
-    // ==================================================
-
-    const finalNotes =
-      groupSummaries.join(
-        "\n\n--- NEXT GROUP ---\n\n"
-      );
-
-
-    const finalPrompt = `
-You are CHATBACK.
-
-Create the FINAL relationship analysis based
-on the complete WhatsApp conversation.
-
-Person being analysed:
-${exName || "Unknown"}
+- Analyze only what is visible in the conversation.
+- Never claim to know someone's private thoughts.
+- Never say something is 100% certain.
+- Use phrases like "the conversation suggests".
+- Do not invent events or facts.
+- If evidence is insufficient, say so.
+- Be emotionally neutral.
+- Keep the answer easy to read.
 
 Provide:
 
-## 1. Relationship Summary
+1. 💬 Relationship Summary
+Give a short summary of the overall communication.
 
-## 2. Who Initiates More
+2. 📱 Who Initiates More
+Explain who appears to start conversations more often.
 
-## 3. Emotional Tone
+3. ❤️ Emotional Tone
+Describe the overall emotional tone.
 
-## 4. Main Communication Pattern
+4. 🔥 Interest Signals
+Mention signs of interest or engagement visible in the chat.
 
-## 5. Connection Score
-Give a score from 0 to 100.
+5. 🚩 Red Flags
+Mention communication patterns that could be concerning.
 
-## 6. Emotional Investment
-Explain who appears more invested based
-only on observable conversation patterns.
+6. 💚 Green Flags
+Mention positive communication patterns.
 
-## 7. Attachment Indicators
+7. 🧠 Communication Pattern
+Explain how both people communicate with each other.
 
-## 8. Red Flags
+8. 💯 Connection Score
+Give a score from 0-100 based only on the conversation.
 
-## 9. Green Flags
+9. 🔍 Final Takeaway
+Give a short honest conclusion.
 
-## 10. Communication Compatibility
+Use headings and bullet points.
 
-## 11. Detailed Relationship Insight
+Do not make the response extremely long.
 
-## 12. Suggested Next Reply
+WHATSAPP CHAT:
 
-## 13. Final Takeaway
-
-IMPORTANT:
-
-- Analyse patterns, not private thoughts.
-- Never say you know exactly what someone feels.
-- Do not invent information.
-- Do not diagnose mental health conditions.
-- Be realistic.
-- Be emotionally neutral.
-- Use readable headings and bullet points.
-
-COMPLETE ANALYSIS NOTES:
-
-${finalNotes}
+${compressedChat}
 `;
 
-    const finalResult =
-      await groq(
-        finalPrompt,
-        premium ? 1500 : 900
+    const groqResponse = await fetch(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+
+        headers: {
+          Authorization: `Bearer ${groqKey}`,
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+          model: "openai/gpt-oss-20b",
+
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are CHATBACK. Analyze WhatsApp conversations clearly, neutrally and concisely."
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
+
+          temperature: 0.5,
+
+          max_tokens: 650
+        })
+      }
+    );
+
+    const data = await groqResponse.json();
+
+    // ---------------------------------------
+    // GROQ ERROR
+    // ---------------------------------------
+
+    if (!groqResponse.ok) {
+      console.error(
+        "Groq Error:",
+        data
       );
 
+      if (groqResponse.status === 429) {
+        return res.status(429).json({
+          error:
+            "AI is temporarily busy. Please try again in a few seconds."
+        });
+      }
 
-    // ==================================================
-    // SAVE FINAL RESULT
-    // ==================================================
+      return res.status(groqResponse.status).json({
+        error:
+          data?.error?.message ||
+          "Groq request failed."
+      });
+    }
 
-    await redis([
+    // ---------------------------------------
+    // GET RESULT
+    // ---------------------------------------
+
+    const result =
+      data?.choices?.[0]?.message?.content;
+
+    if (!result) {
+      return res.status(502).json({
+        error:
+          "AI returned an empty response."
+      });
+    }
+
+    // ---------------------------------------
+    // SAVE RESULT
+    // 30 DAYS
+    // ---------------------------------------
+
+    await redisCommand([
       "SET",
-      finalCacheKey,
-      JSON.stringify({
-        result: finalResult,
-        chunks: chunks.length,
-        groups: groups.length,
-        createdAt:
-          new Date().toISOString()
-      }),
+      cacheKey,
+      result,
       "EX",
-      String(CACHE_SECONDS)
+      "2592000"
     ]);
 
-
-    // ==================================================
+    // ---------------------------------------
     // RESPONSE
-    // ==================================================
+    // ---------------------------------------
 
     return res.status(200).json({
       success: true,
-      cached: false,
-      result: finalResult,
-      chunks: chunks.length,
-      groups: groups.length
+      result,
+      cached: false
     });
 
-
   } catch (error) {
-
     console.error(
       "CHATBACK ERROR:",
       error
