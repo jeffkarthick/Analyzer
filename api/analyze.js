@@ -1,12 +1,14 @@
 import crypto from "crypto";
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_URL =
+  "https://api.groq.com/openai/v1/chat/completions";
 
-// Keep each request comfortably below the 8K TPM limit.
-const CHUNK_CHARS = 18000;
+// Safe chunk size.
+// Character count is NOT the same as token count.
+const CHUNK_CHARS = 10000;
 
-// Maximum number of characters accepted from one WhatsApp export.
-const MAX_CHAT_CHARS = 200000;
+// Maximum output for each chunk
+const CHUNK_MAX_TOKENS = 500;
 
 function createChatHash(chatText, exName) {
   return crypto
@@ -20,7 +22,9 @@ async function redisCommand(command) {
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
 
   if (!url || !token) {
-    throw new Error("Upstash Redis environment variables are missing.");
+    throw new Error(
+      "Upstash Redis environment variables are missing."
+    );
   }
 
   const response = await fetch(url, {
@@ -37,8 +41,8 @@ async function redisCommand(command) {
   if (!response.ok) {
     throw new Error(
       data?.error ||
-      data?.message ||
-      "Upstash request failed."
+        data?.message ||
+        "Upstash request failed."
     );
   }
 
@@ -53,7 +57,6 @@ async function getCachedAnalysis(hash) {
 }
 
 async function saveCachedAnalysis(hash, result) {
-  // Cache for 30 days.
   await redisCommand([
     "SET",
     `chatback:analysis:${hash}`,
@@ -63,7 +66,7 @@ async function saveCachedAnalysis(hash, result) {
   ]);
 }
 
-async function askGroq(prompt, maxTokens = 700) {
+async function askGroq(prompt, maxTokens) {
   const response = await fetch(GROQ_URL, {
     method: "POST",
 
@@ -79,7 +82,7 @@ async function askGroq(prompt, maxTokens = 700) {
         {
           role: "system",
           content:
-            "You are CHATBACK, a neutral WhatsApp relationship chat analyzer. Infer patterns only from the text. Never claim certainty about private feelings."
+            "You are CHATBACK, a neutral WhatsApp relationship chat analyzer. Only infer patterns from the provided text."
         },
         {
           role: "user",
@@ -87,7 +90,7 @@ async function askGroq(prompt, maxTokens = 700) {
         }
       ],
 
-      temperature: 0.4,
+      temperature: 0.3,
       max_tokens: maxTokens
     })
   });
@@ -99,7 +102,7 @@ async function askGroq(prompt, maxTokens = 700) {
 
     throw new Error(
       data?.error?.message ||
-      "Groq request failed."
+        "Groq request failed."
     );
   }
 
@@ -107,27 +110,51 @@ async function askGroq(prompt, maxTokens = 700) {
     data?.choices?.[0]?.message?.content;
 
   if (!result) {
-    throw new Error("Groq returned an empty response.");
+    throw new Error(
+      "Groq returned an empty response."
+    );
   }
 
   return result;
 }
 
-function splitChat(chatText) {
-  const chunks = [];
 
-  for (
-    let i = 0;
-    i < chatText.length;
-    i += CHUNK_CHARS
-  ) {
-    chunks.push(
-      chatText.slice(i, i + CHUNK_CHARS)
-    );
+// ----------------------------------------
+// SMART CHAT SPLITTER
+// ----------------------------------------
+
+function splitChat(chatText) {
+  const lines = chatText.split(/\r?\n/);
+
+  const chunks = [];
+  let current = "";
+
+  for (const line of lines) {
+    if (
+      current.length + line.length + 1 >
+      CHUNK_CHARS
+    ) {
+      if (current.trim()) {
+        chunks.push(current);
+      }
+
+      current = line;
+    } else {
+      current += line + "\n";
+    }
+  }
+
+  if (current.trim()) {
+    chunks.push(current);
   }
 
   return chunks;
 }
+
+
+// ----------------------------------------
+// MAIN HANDLER
+// ----------------------------------------
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -143,9 +170,10 @@ export default async function handler(req, res) {
       premium = false
     } = req.body || {};
 
-    // -----------------------------
-    // ENV CHECK
-    // -----------------------------
+
+    // ----------------------------------------
+    // ENVIRONMENT CHECK
+    // ----------------------------------------
 
     if (!process.env.GROQ_API_KEY) {
       return res.status(500).json({
@@ -163,9 +191,10 @@ export default async function handler(req, res) {
       });
     }
 
-    // -----------------------------
-    // CHAT VALIDATION
-    // -----------------------------
+
+    // ----------------------------------------
+    // CHAT CHECK
+    // ----------------------------------------
 
     if (
       !chatText ||
@@ -173,38 +202,36 @@ export default async function handler(req, res) {
       chatText.trim().length < 20
     ) {
       return res.status(400).json({
-        error: "Please provide a WhatsApp chat."
+        error:
+          "Please provide a WhatsApp chat."
       });
     }
 
     const cleanChat = chatText.trim();
 
-    if (cleanChat.length > MAX_CHAT_CHARS) {
-      return res.status(400).json({
-        error:
-          "This WhatsApp chat is too large. Please upload a smaller export."
-      });
-    }
 
-    // -----------------------------
-    // CREATE UNIQUE HASH
-    // -----------------------------
+    // ----------------------------------------
+    // HASH
+    // ----------------------------------------
 
     const chatHash = createChatHash(
       cleanChat,
       exName
     );
 
-    // -----------------------------
-    // CHECK UPSTASH
-    // -----------------------------
 
-    const cached = await getCachedAnalysis(
-      chatHash
-    );
+    // ----------------------------------------
+    // CHECK UPSTASH
+    // ----------------------------------------
+
+    const cached =
+      await getCachedAnalysis(chatHash);
 
     if (cached) {
-      console.log("CACHE HIT:", chatHash);
+      console.log(
+        "CHATBACK CACHE HIT:",
+        chatHash
+      );
 
       const parsed =
         typeof cached === "string"
@@ -219,80 +246,99 @@ export default async function handler(req, res) {
       });
     }
 
-    console.log("CACHE MISS:", chatHash);
 
-    // -----------------------------
-    // SPLIT CHAT
-    // -----------------------------
+    // ----------------------------------------
+    // SPLIT
+    // ----------------------------------------
 
     const chunks = splitChat(cleanChat);
 
     console.log(
-      `Analysing ${chunks.length} chunks`
+      "CHATBACK TOTAL CHUNKS:",
+      chunks.length
     );
+
+
+    // ----------------------------------------
+    // ANALYSE CHUNKS
+    // ----------------------------------------
 
     const chunkResults = [];
 
-    // -----------------------------
-    // ANALYSE EACH CHUNK
-    // -----------------------------
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
+    for (
+      let i = 0;
+      i < chunks.length;
+      i++
+    ) {
+      console.log(
+        `Analysing chunk ${i + 1}/${chunks.length}`
+      );
 
       const prompt = `
-You are analysing PART ${i + 1} of ${chunks.length}
-of a WhatsApp conversation.
+You are analysing part ${i + 1} of ${
+        chunks.length
+      } of a WhatsApp conversation.
 
-Person being analysed:
+Person:
 ${exName || "Unknown"}
 
-Extract useful relationship patterns from this section.
+Find useful relationship patterns.
 
-Focus on:
+Analyse:
+
 - Who initiates
 - Emotional tone
-- Interest/engagement indicators
+- Interest and engagement
 - Communication style
 - Positive signs
 - Negative signs
-- Important changes in behaviour
-- Evidence from the conversation
+- Changes in behaviour
+- Important relationship signals
 
-Do NOT make absolute claims about someone's private feelings.
+Do not claim certainty about private feelings.
 
-Return concise structured notes.
+Return concise notes.
 
-CHAT PART:
+WHATSAPP CHAT PART:
 
-${chunk}
+${chunks[i]}
 `;
 
       const result = await askGroq(
         prompt,
-        600
+        CHUNK_MAX_TOKENS
       );
 
       chunkResults.push(result);
+
+      // Small delay to reduce rate-limit problems.
+      if (i < chunks.length - 1) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 1200)
+        );
+      }
     }
 
-    // -----------------------------
-    // FINAL ANALYSIS
-    // -----------------------------
+
+    // ----------------------------------------
+    // COMBINE NOTES
+    // ----------------------------------------
 
     const combinedNotes =
-      chunkResults.join("\n\n--- NEXT PART ---\n\n");
+      chunkResults.join(
+        "\n\n--- NEXT CHAT PART ---\n\n"
+      );
 
-    // Protect final request size.
-    const finalNotes =
-      combinedNotes.slice(0, 30000);
+
+    // ----------------------------------------
+    // FINAL ANALYSIS
+    // ----------------------------------------
 
     const finalPrompt = `
 You are CHATBACK.
 
-Create the final relationship analysis using
-the notes extracted from multiple sections of
-a WhatsApp conversation.
+Create the final relationship analysis from
+the notes collected from the entire WhatsApp chat.
 
 Person being analysed:
 ${exName || "Unknown"}
@@ -313,16 +359,17 @@ Provide:
 12. Suggested next reply
 13. Final takeaway
 
-Important:
-- These are patterns inferred from text.
-- Never claim certainty about someone's private feelings.
-- Do not invent facts.
-- Be realistic and emotionally neutral.
+Rules:
+
+- Infer patterns only from the text.
+- Never claim certainty about private feelings.
+- Never invent facts.
+- Be realistic.
 - Use headings and bullet points.
 
-ANALYSIS NOTES:
+CHAT ANALYSIS NOTES:
 
-${finalNotes}
+${combinedNotes}
 `;
 
     const finalResult = await askGroq(
@@ -330,24 +377,25 @@ ${finalNotes}
       premium ? 1600 : 900
     );
 
-    // -----------------------------
-    // SAVE TO UPSTASH
-    // -----------------------------
 
-    const cacheData = {
-      result: finalResult,
-      chunks: chunks.length,
-      createdAt: new Date().toISOString()
-    };
+    // ----------------------------------------
+    // SAVE TO UPSTASH
+    // ----------------------------------------
 
     await saveCachedAnalysis(
       chatHash,
-      cacheData
+      {
+        result: finalResult,
+        chunks: chunks.length,
+        createdAt:
+          new Date().toISOString()
+      }
     );
 
-    // -----------------------------
-    // RETURN
-    // -----------------------------
+
+    // ----------------------------------------
+    // RESPONSE
+    // ----------------------------------------
 
     return res.status(200).json({
       success: true,
@@ -357,7 +405,10 @@ ${finalNotes}
     });
 
   } catch (error) {
-    console.error("CHATBACK ERROR:", error);
+    console.error(
+      "CHATBACK ERROR:",
+      error
+    );
 
     return res.status(500).json({
       error:
