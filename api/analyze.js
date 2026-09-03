@@ -3,27 +3,41 @@ import crypto from "crypto";
 const GROQ_URL =
   "https://api.groq.com/openai/v1/chat/completions";
 
-// Safe chunk size.
-// Character count is NOT the same as token count.
-const CHUNK_CHARS = 10000;
+const MODEL = "openai/gpt-oss-20b";
 
-// Maximum output for each chunk
-const CHUNK_MAX_TOKENS = 500;
+// Keep requests safely below Groq 8K token limit.
+const CHUNK_CHARS = 9000;
 
-function createChatHash(chatText, exName) {
+// Number of chunk summaries sent to one group-analysis request.
+const GROUP_SIZE = 6;
+
+// Cache for 30 days.
+const CACHE_SECONDS = 60 * 60 * 24 * 30;
+
+
+// ======================================================
+// HASH
+// ======================================================
+
+function createHash(text, exName) {
   return crypto
     .createHash("sha256")
-    .update(`${exName || ""}|${chatText}`)
+    .update(`${exName || ""}|${text}`)
     .digest("hex");
 }
 
-async function redisCommand(command) {
+
+// ======================================================
+// UPSTASH
+// ======================================================
+
+async function redis(command) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
 
   if (!url || !token) {
     throw new Error(
-      "Upstash Redis environment variables are missing."
+      "UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN is missing."
     );
   }
 
@@ -41,32 +55,20 @@ async function redisCommand(command) {
   if (!response.ok) {
     throw new Error(
       data?.error ||
-        data?.message ||
-        "Upstash request failed."
+      data?.message ||
+      "Upstash request failed."
     );
   }
 
   return data.result;
 }
 
-async function getCachedAnalysis(hash) {
-  return await redisCommand([
-    "GET",
-    `chatback:analysis:${hash}`
-  ]);
-}
 
-async function saveCachedAnalysis(hash, result) {
-  await redisCommand([
-    "SET",
-    `chatback:analysis:${hash}`,
-    JSON.stringify(result),
-    "EX",
-    "2592000"
-  ]);
-}
+// ======================================================
+// GROQ
+// ======================================================
 
-async function askGroq(prompt, maxTokens) {
+async function groq(prompt, maxTokens = 600) {
   const response = await fetch(GROQ_URL, {
     method: "POST",
 
@@ -76,13 +78,13 @@ async function askGroq(prompt, maxTokens) {
     },
 
     body: JSON.stringify({
-      model: "openai/gpt-oss-20b",
+      model: MODEL,
 
       messages: [
         {
           role: "system",
           content:
-            "You are CHATBACK, a neutral WhatsApp relationship chat analyzer. Only infer patterns from the provided text."
+            "You are CHATBACK, a neutral WhatsApp relationship chat analyzer. Infer patterns only from the text. Never claim certainty about private feelings."
         },
         {
           role: "user",
@@ -102,7 +104,7 @@ async function askGroq(prompt, maxTokens) {
 
     throw new Error(
       data?.error?.message ||
-        "Groq request failed."
+      "Groq request failed."
     );
   }
 
@@ -119,9 +121,9 @@ async function askGroq(prompt, maxTokens) {
 }
 
 
-// ----------------------------------------
-// SMART CHAT SPLITTER
-// ----------------------------------------
+// ======================================================
+// SPLIT WHATSAPP CHAT
+// ======================================================
 
 function splitChat(chatText) {
   const lines = chatText.split(/\r?\n/);
@@ -130,33 +132,38 @@ function splitChat(chatText) {
   let current = "";
 
   for (const line of lines) {
+
     if (
       current.length + line.length + 1 >
       CHUNK_CHARS
     ) {
+
       if (current.trim()) {
-        chunks.push(current);
+        chunks.push(current.trim());
       }
 
-      current = line;
+      current = line + "\n";
+
     } else {
+
       current += line + "\n";
     }
   }
 
   if (current.trim()) {
-    chunks.push(current);
+    chunks.push(current.trim());
   }
 
   return chunks;
 }
 
 
-// ----------------------------------------
-// MAIN HANDLER
-// ----------------------------------------
+// ======================================================
+// MAIN
+// ======================================================
 
 export default async function handler(req, res) {
+
   if (req.method !== "POST") {
     return res.status(405).json({
       error: "Method not allowed"
@@ -164,6 +171,7 @@ export default async function handler(req, res) {
   }
 
   try {
+
     const {
       exName,
       chatText,
@@ -171,9 +179,9 @@ export default async function handler(req, res) {
     } = req.body || {};
 
 
-    // ----------------------------------------
+    // ==================================================
     // ENVIRONMENT CHECK
-    // ----------------------------------------
+    // ==================================================
 
     if (!process.env.GROQ_API_KEY) {
       return res.status(500).json({
@@ -192,9 +200,9 @@ export default async function handler(req, res) {
     }
 
 
-    // ----------------------------------------
-    // CHAT CHECK
-    // ----------------------------------------
+    // ==================================================
+    // CHAT VALIDATION
+    // ==================================================
 
     if (
       !chatText ||
@@ -210,33 +218,49 @@ export default async function handler(req, res) {
     const cleanChat = chatText.trim();
 
 
-    // ----------------------------------------
-    // HASH
-    // ----------------------------------------
+    // ==================================================
+    // CREATE CHAT HASH
+    // ==================================================
 
-    const chatHash = createChatHash(
+    const chatHash = createHash(
       cleanChat,
       exName
     );
 
+    console.log(
+      "CHAT HASH:",
+      chatHash
+    );
 
-    // ----------------------------------------
-    // CHECK UPSTASH
-    // ----------------------------------------
 
-    const cached =
-      await getCachedAnalysis(chatHash);
+    // ==================================================
+    // CHECK FINAL CACHE
+    // ==================================================
 
-    if (cached) {
+    const finalCacheKey =
+      `chatback:final:${chatHash}`;
+
+    const cachedFinal =
+      await redis([
+        "GET",
+        finalCacheKey
+      ]);
+
+
+    // ==================================================
+    // CACHE HIT
+    // ==================================================
+
+    if (cachedFinal) {
+
       console.log(
-        "CHATBACK CACHE HIT:",
-        chatHash
+        "FINAL CACHE HIT"
       );
 
       const parsed =
-        typeof cached === "string"
-          ? JSON.parse(cached)
-          : cached;
+        typeof cachedFinal === "string"
+          ? JSON.parse(cachedFinal)
+          : cachedFinal;
 
       return res.status(200).json({
         success: true,
@@ -247,31 +271,70 @@ export default async function handler(req, res) {
     }
 
 
-    // ----------------------------------------
-    // SPLIT
-    // ----------------------------------------
+    // ==================================================
+    // SPLIT CHAT
+    // ==================================================
 
-    const chunks = splitChat(cleanChat);
+    const chunks =
+      splitChat(cleanChat);
 
     console.log(
-      "CHATBACK TOTAL CHUNKS:",
+      "TOTAL CHUNKS:",
       chunks.length
     );
 
 
-    // ----------------------------------------
-    // ANALYSE CHUNKS
-    // ----------------------------------------
+    // ==================================================
+    // ANALYSE EACH CHUNK
+    // ==================================================
 
-    const chunkResults = [];
+    const chunkSummaries = [];
 
     for (
       let i = 0;
       i < chunks.length;
       i++
     ) {
+
+      const chunkKey =
+        `chatback:chunk:${chatHash}:${i}`;
+
+      // ----------------------------------------------
+      // CHECK CHUNK CACHE
+      // ----------------------------------------------
+
+      const cachedChunk =
+        await redis([
+          "GET",
+          chunkKey
+        ]);
+
+
+      if (cachedChunk) {
+
+        console.log(
+          `CHUNK ${i + 1} CACHE HIT`
+        );
+
+        const parsed =
+          typeof cachedChunk === "string"
+            ? JSON.parse(cachedChunk)
+            : cachedChunk;
+
+        chunkSummaries.push(
+          parsed.summary
+        );
+
+        continue;
+      }
+
+
+      // ----------------------------------------------
+      // GROQ CHUNK ANALYSIS
+      // ----------------------------------------------
+
       console.log(
-        `Analysing chunk ${i + 1}/${chunks.length}`
+        `ANALYSING CHUNK ${i + 1}/${chunks.length}`
       );
 
       const prompt = `
@@ -279,132 +342,337 @@ You are analysing part ${i + 1} of ${
         chunks.length
       } of a WhatsApp conversation.
 
-Person:
+Person being analysed:
 ${exName || "Unknown"}
 
-Find useful relationship patterns.
+Extract useful relationship patterns from this
+part of the conversation.
 
-Analyse:
+Focus on:
 
-- Who initiates
+- Who initiates conversations
+- Who replies more
 - Emotional tone
 - Interest and engagement
 - Communication style
+- Affection indicators
+- Distance indicators
 - Positive signs
 - Negative signs
-- Changes in behaviour
-- Important relationship signals
+- Important behaviour changes
+- Important evidence from the messages
 
-Do not claim certainty about private feelings.
+Do NOT claim certainty about private feelings.
 
-Return concise notes.
+Return concise analytical notes that can later
+be combined with other parts of the conversation.
 
-WHATSAPP CHAT PART:
+CHAT PART:
 
 ${chunks[i]}
 `;
 
-      const result = await askGroq(
-        prompt,
-        CHUNK_MAX_TOKENS
-      );
+      const summary =
+        await groq(
+          prompt,
+          500
+        );
 
-      chunkResults.push(result);
 
-      // Small delay to reduce rate-limit problems.
+      // ----------------------------------------------
+      // SAVE CHUNK SUMMARY
+      // ----------------------------------------------
+
+      await redis([
+        "SET",
+        chunkKey,
+        JSON.stringify({
+          summary,
+          chunk: i,
+          createdAt:
+            new Date().toISOString()
+        }),
+        "EX",
+        String(CACHE_SECONDS)
+      ]);
+
+      chunkSummaries.push(summary);
+
+
+      // ----------------------------------------------
+      // SMALL DELAY
+      // ----------------------------------------------
+
       if (i < chunks.length - 1) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, 1200)
+
+        await new Promise(
+          resolve =>
+            setTimeout(resolve, 1500)
         );
       }
     }
 
 
-    // ----------------------------------------
-    // COMBINE NOTES
-    // ----------------------------------------
+    // ==================================================
+    // GROUP SUMMARIES
+    // ==================================================
 
-    const combinedNotes =
-      chunkResults.join(
-        "\n\n--- NEXT CHAT PART ---\n\n"
+    const groups = [];
+
+    for (
+      let i = 0;
+      i < chunkSummaries.length;
+      i += GROUP_SIZE
+    ) {
+
+      groups.push(
+        chunkSummaries.slice(
+          i,
+          i + GROUP_SIZE
+        )
+      );
+    }
+
+    console.log(
+      "TOTAL GROUPS:",
+      groups.length
+    );
+
+
+    // ==================================================
+    // ANALYSE GROUPS
+    // ==================================================
+
+    const groupSummaries = [];
+
+    for (
+      let i = 0;
+      i < groups.length;
+      i++
+    ) {
+
+      const groupKey =
+        `chatback:group:${chatHash}:${i}`;
+
+      // ----------------------------------------------
+      // CHECK GROUP CACHE
+      // ----------------------------------------------
+
+      const cachedGroup =
+        await redis([
+          "GET",
+          groupKey
+        ]);
+
+      if (cachedGroup) {
+
+        console.log(
+          `GROUP ${i + 1} CACHE HIT`
+        );
+
+        const parsed =
+          typeof cachedGroup === "string"
+            ? JSON.parse(cachedGroup)
+            : cachedGroup;
+
+        groupSummaries.push(
+          parsed.summary
+        );
+
+        continue;
+      }
+
+
+      // ----------------------------------------------
+      // GROUP PROMPT
+      // ----------------------------------------------
+
+      const groupText =
+        groups[i].join(
+          "\n\n--- NEXT SECTION ---\n\n"
+        );
+
+      const prompt = `
+You are CHATBACK.
+
+You are combining several analysis sections
+from the same WhatsApp conversation.
+
+Person:
+${exName || "Unknown"}
+
+Identify the larger patterns across these
+sections.
+
+Focus on:
+
+- Initiation balance
+- Emotional investment indicators
+- Communication consistency
+- Affection
+- Distance
+- Conflict
+- Interest
+- Positive relationship signals
+- Negative relationship signals
+- Behaviour changes
+
+Do not claim certainty about private feelings.
+
+Return a concise overall relationship summary.
+
+SECTION ANALYSES:
+
+${groupText}
+`;
+
+      const summary =
+        await groq(
+          prompt,
+          600
+        );
+
+
+      // ----------------------------------------------
+      // SAVE GROUP
+      // ----------------------------------------------
+
+      await redis([
+        "SET",
+        groupKey,
+        JSON.stringify({
+          summary,
+          group: i,
+          createdAt:
+            new Date().toISOString()
+        }),
+        "EX",
+        String(CACHE_SECONDS)
+      ]);
+
+      groupSummaries.push(summary);
+
+
+      // ----------------------------------------------
+      // DELAY
+      // ----------------------------------------------
+
+      if (i < groups.length - 1) {
+
+        await new Promise(
+          resolve =>
+            setTimeout(resolve, 1500)
+        );
+      }
+    }
+
+
+    // ==================================================
+    // FINAL ANALYSIS
+    // ==================================================
+
+    const finalNotes =
+      groupSummaries.join(
+        "\n\n--- NEXT GROUP ---\n\n"
       );
 
-
-    // ----------------------------------------
-    // FINAL ANALYSIS
-    // ----------------------------------------
 
     const finalPrompt = `
 You are CHATBACK.
 
-Create the final relationship analysis from
-the notes collected from the entire WhatsApp chat.
+Create the FINAL relationship analysis based
+on the complete WhatsApp conversation.
 
 Person being analysed:
 ${exName || "Unknown"}
 
 Provide:
 
-1. Relationship summary
-2. Who appears to initiate more
-3. Emotional tone
-4. Main communication pattern
-5. Overall connection score /100
-6. Who appears more emotionally invested and why
-7. Attachment indicators
-8. Red flags
-9. Green flags
-10. Communication compatibility
-11. Detailed relationship insight
-12. Suggested next reply
-13. Final takeaway
+## 1. Relationship Summary
 
-Rules:
+## 2. Who Initiates More
 
-- Infer patterns only from the text.
-- Never claim certainty about private feelings.
-- Never invent facts.
+## 3. Emotional Tone
+
+## 4. Main Communication Pattern
+
+## 5. Connection Score
+Give a score from 0 to 100.
+
+## 6. Emotional Investment
+Explain who appears more invested based
+only on observable conversation patterns.
+
+## 7. Attachment Indicators
+
+## 8. Red Flags
+
+## 9. Green Flags
+
+## 10. Communication Compatibility
+
+## 11. Detailed Relationship Insight
+
+## 12. Suggested Next Reply
+
+## 13. Final Takeaway
+
+IMPORTANT:
+
+- Analyse patterns, not private thoughts.
+- Never say you know exactly what someone feels.
+- Do not invent information.
+- Do not diagnose mental health conditions.
 - Be realistic.
-- Use headings and bullet points.
+- Be emotionally neutral.
+- Use readable headings and bullet points.
 
-CHAT ANALYSIS NOTES:
+COMPLETE ANALYSIS NOTES:
 
-${combinedNotes}
+${finalNotes}
 `;
 
-    const finalResult = await askGroq(
-      finalPrompt,
-      premium ? 1600 : 900
-    );
+    const finalResult =
+      await groq(
+        finalPrompt,
+        premium ? 1500 : 900
+      );
 
 
-    // ----------------------------------------
-    // SAVE TO UPSTASH
-    // ----------------------------------------
+    // ==================================================
+    // SAVE FINAL RESULT
+    // ==================================================
 
-    await saveCachedAnalysis(
-      chatHash,
-      {
+    await redis([
+      "SET",
+      finalCacheKey,
+      JSON.stringify({
         result: finalResult,
         chunks: chunks.length,
+        groups: groups.length,
         createdAt:
           new Date().toISOString()
-      }
-    );
+      }),
+      "EX",
+      String(CACHE_SECONDS)
+    ]);
 
 
-    // ----------------------------------------
+    // ==================================================
     // RESPONSE
-    // ----------------------------------------
+    // ==================================================
 
     return res.status(200).json({
       success: true,
       cached: false,
       result: finalResult,
-      chunks: chunks.length
+      chunks: chunks.length,
+      groups: groups.length
     });
 
+
   } catch (error) {
+
     console.error(
       "CHATBACK ERROR:",
       error
